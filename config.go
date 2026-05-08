@@ -39,32 +39,41 @@ type PollingConfig struct {
 
 // WorkspaceConfig defines workspace settings.
 type WorkspaceConfig struct {
-	Root string `yaml:"root"`
+	Root                      string   `yaml:"root"`
+	WorktreeBare              string   `yaml:"worktree_bare"`
+	WorktreeRemote            string   `yaml:"worktree_remote"`
+	MergeOnTerminal           bool     `yaml:"merge_on_terminal"`
+	MergeTarget               string   `yaml:"merge_target"`
+	ChildRequiresParentBranch bool     `yaml:"child_requires_parent_branch"`
+	ChildParentReadyStates    []string `yaml:"child_parent_ready_states"`
+	ChildSyncOnStart          bool     `yaml:"child_sync_on_start"`
+	ParentReviewState         string   `yaml:"parent_review_state"`
 }
 
 // HooksConfig defines lifecycle shell hooks.
 type HooksConfig struct {
-	AfterCreate string `yaml:"after_create"`
-	BeforeRun   string `yaml:"before_run"`
-	AfterRun    string `yaml:"after_run"`
+	AfterCreate  string `yaml:"after_create"`
+	BeforeRun    string `yaml:"before_run"`
+	AfterRun     string `yaml:"after_run"`
 	BeforeRemove string `yaml:"before_remove"`
-	TimeoutMs   int    `yaml:"timeout_ms"`
+	TimeoutMs    int    `yaml:"timeout_ms"`
 }
 
 // AgentConfig defines agent concurrency and retry settings.
 type AgentConfig struct {
-	MaxConcurrentAgents      int            `yaml:"max_concurrent_agents"`
-	MaxTurns                 int            `yaml:"max_turns"`
-	MaxRetryBackoffMs        int            `yaml:"max_retry_backoff_ms"`
+	MaxConcurrentAgents        int            `yaml:"max_concurrent_agents"`
+	MaxTurns                   int            `yaml:"max_turns"`
+	MaxRetryBackoffMs          int            `yaml:"max_retry_backoff_ms"`
 	MaxConcurrentAgentsByState map[string]int `yaml:"max_concurrent_agents_by_state"`
 }
 
 // CodexConfig defines agent subprocess settings.
 type CodexConfig struct {
-	Command        string `yaml:"command"`
-	TurnTimeoutMs  int    `yaml:"turn_timeout_ms"`
-	ReadTimeoutMs  int    `yaml:"read_timeout_ms"`
-	StallTimeoutMs int    `yaml:"stall_timeout_ms"`
+	Command          string `yaml:"command"`
+	ModelLabelPrefix string `yaml:"model_label_prefix"`
+	TurnTimeoutMs    int    `yaml:"turn_timeout_ms"`
+	ReadTimeoutMs    int    `yaml:"read_timeout_ms"`
+	StallTimeoutMs   *int   `yaml:"stall_timeout_ms"`
 }
 
 // Workflow holds the parsed WORKFLOW.md payload.
@@ -152,6 +161,18 @@ func applyDefaults(cfg *Config, workflowDir string) {
 	}
 	// Expand ~ and resolve relative paths
 	cfg.Workspace.Root = resolvePath(cfg.Workspace.Root, workflowDir)
+	cfg.Workspace.WorktreeBare = resolvePath(cfg.Workspace.WorktreeBare, workflowDir)
+	if cfg.Workspace.MergeTarget == "" {
+		cfg.Workspace.MergeTarget = "main"
+	}
+	if cfg.Workspace.ChildParentReadyStates == nil {
+		cfg.Workspace.ChildParentReadyStates = []string{"In Review", "Done"}
+	}
+	if cfg.Workspace.ParentReviewState == "" {
+		cfg.Workspace.ParentReviewState = "In Review"
+	}
+	cfg.Workspace.ChildRequiresParentBranch = true
+	cfg.Workspace.ChildSyncOnStart = true
 
 	if cfg.Hooks.TimeoutMs == 0 {
 		cfg.Hooks.TimeoutMs = 60000
@@ -169,7 +190,10 @@ func applyDefaults(cfg *Config, workflowDir string) {
 		cfg.Agent.MaxConcurrentAgentsByState = make(map[string]int)
 	}
 	if cfg.Codex.Command == "" {
-		cfg.Codex.Command = "kimi-cli --yolo"
+		cfg.Codex.Command = "codex exec --dangerously-bypass-approvals-and-sandbox"
+	}
+	if cfg.Codex.ModelLabelPrefix == "" {
+		cfg.Codex.ModelLabelPrefix = "model:"
 	}
 	if cfg.Codex.TurnTimeoutMs == 0 {
 		cfg.Codex.TurnTimeoutMs = 3600000
@@ -177,8 +201,9 @@ func applyDefaults(cfg *Config, workflowDir string) {
 	if cfg.Codex.ReadTimeoutMs == 0 {
 		cfg.Codex.ReadTimeoutMs = 5000
 	}
-	if cfg.Codex.StallTimeoutMs == 0 {
-		cfg.Codex.StallTimeoutMs = 300000
+	if cfg.Codex.StallTimeoutMs == nil {
+		defaultStall := 300000
+		cfg.Codex.StallTimeoutMs = &defaultStall
 	}
 }
 
@@ -254,6 +279,20 @@ func (c *Config) TerminalStateSet() map[string]bool {
 		s[normalizeState(st)] = true
 	}
 	return s
+}
+
+// ParentReadyStateSet returns states that allow child issues to start.
+func (c *Config) ParentReadyStateSet() map[string]bool {
+	s := make(map[string]bool, len(c.Workspace.ChildParentReadyStates))
+	for _, st := range c.Workspace.ChildParentReadyStates {
+		s[normalizeState(st)] = true
+	}
+	return s
+}
+
+// IsParentReady returns true if a parent issue state can be used as a child base.
+func (c *Config) IsParentReady(state string) bool {
+	return c.ParentReadyStateSet()[normalizeState(state)]
 }
 
 // IsTerminal returns true if the given state is terminal.

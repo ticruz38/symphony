@@ -2,7 +2,7 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: my-project
+  project_slug: dashboard-8b8825a0880c
   active_states:
     - Todo
     - In Progress
@@ -17,24 +17,25 @@ polling:
   interval_ms: 30000
 
 workspace:
-  root: ~/symphony_workspaces
-  # Optional: use git worktrees instead of plain directories.
-  # worktree_bare: ~/goodrock-bare
-  # worktree_remote: https://github.com/yourteam/goodrock.git
+  root: ~/symphony_workspaces/app
+  worktree_bare: ~/goodrock-bare
+  worktree_remote: https://github.com/sotach1/goodrock.git
+  merge_on_terminal: true
+  merge_target: main
 
 hooks:
   after_create: |
-    echo "Workspace created"
+    echo "App worktree ready"
   before_run: |
-    echo "Starting work"
+    echo "Starting app work"
   after_run: |
-    echo "Work finished"
+    echo "App work finished"
   before_remove: |
-    echo "Cleaning up"
+    docker rm -f "goodrock-preview-${SYMPHONY_ISSUE_IDENTIFIER}" 2>/dev/null || true
   timeout_ms: 60000
 
 agent:
-  max_concurrent_agents: 10
+  max_concurrent_agents: 3
   max_turns: 500
   max_retry_backoff_ms: 300000
 
@@ -46,7 +47,10 @@ codex:
   stall_timeout_ms: 300000
 ---
 
-You are an autonomous software engineer working on a Linear issue.
+You are an autonomous software engineer working on the **Goodrock Dashboard** app.
+
+This is a **SvelteKit + Vite** application located in `apps/app/`.
+**Do not modify files outside of `apps/app/` unless explicitly instructed.**
 
 Issue: {{.issue.Identifier}} - {{.issue.Title}}
 {{if .issue.Description}}
@@ -65,7 +69,7 @@ Blocked by:
 {{end}}
 {{end}}
 
-Please implement the necessary changes to resolve this issue. Work in the provided workspace directory.
+Please implement the necessary changes to resolve this issue. Work only in `apps/app/`.
 
 ## Tools
 
@@ -77,7 +81,7 @@ You have access to the `symphony-tool` command for interacting with Linear.
 - Move the issue to another state:
   `symphony-tool linear-update-state --issue-id {{.issue.ID}} --state-name "State Name"`
 
-- Update the issue description:
+- Update the issue description (appends by default):
   `symphony-tool linear-update-description --issue-id {{.issue.ID}} --description "Updated description"`
 
 - Add a label:
@@ -93,8 +97,11 @@ If the issue is unclear, missing requirements, or contains contradictions:
 3. Exit without making code changes.
 
 When you believe the implementation is complete:
-1. Move the issue to "In Review".
-2. Exit.
+1. Deploy a preview by running:
+   `./scripts/preview.sh app {{.issue.Identifier}}`
+2. Post a comment with the preview URL.
+3. Move the issue to "In Review".
+4. Exit.
 
 {{if .attempt}}
 This is retry attempt {{.attempt}}. Please review any previous work and continue accordingly.

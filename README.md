@@ -1,6 +1,6 @@
 # Symphony (Go)
 
-A minimal Go implementation of the [OpenAI Symphony spec](https://github.com/openai/symphony/blob/main/SPEC.md), adapted to use `kimi-cli` as the coding agent instead of Codex.
+A minimal Go implementation of the [OpenAI Symphony spec](https://github.com/openai/symphony/blob/main/SPEC.md), using Codex as the coding agent.
 
 ## Philosophy
 
@@ -12,7 +12,7 @@ A minimal Go implementation of the [OpenAI Symphony spec](https://github.com/ope
 
 - Polls Linear for active issues
 - Creates isolated per-issue workspaces
-- Runs `kimi-cli --yolo` in each workspace
+- Runs `codex exec` in each workspace
 - Handles retries with exponential backoff
 - Stall detection and process termination
 - Hot reload of `WORKFLOW.md` without restart
@@ -21,7 +21,7 @@ A minimal Go implementation of the [OpenAI Symphony spec](https://github.com/ope
 ## Requirements
 
 - Go 1.21+
-- `kimi-cli` installed and in your PATH
+- Codex CLI installed and in your PATH
 - Linear API key (`LINEAR_API_KEY` env var)
 
 ## Build
@@ -47,10 +47,11 @@ tracker:
   project_slug: my-project      # your Linear project slug
 
 agent:
-  max_turns: 500                # max kimi-cli invocations per issue
+  max_turns: 500                # max Codex invocations per issue
 
 codex:
-  command: kimi-cli --yolo      # agent command (configurable)
+  command: codex exec --dangerously-bypass-approvals-and-sandbox
+  model_label_prefix: "model:"  # Linear label model:gpt-5.4 -> codex -m gpt-5.4
   turn_timeout_ms: 3600000      # 1 hour max per turn
   stall_timeout_ms: 300000      # 5 min with no output = kill
 ```
@@ -99,7 +100,7 @@ workflow.go     → Prompt template rendering
 linear.go       → Linear GraphQL client
 orchestrator.go → Poll loop, dispatch, retry, reconciliation
 workspace.go    → Directory lifecycle + hooks
-agent.go        → kimi-cli subprocess runner
+agent.go        → Codex subprocess runner
 logger.go       → Structured key=value logs
 state.go        → In-memory orchestrator state machine
 ```
@@ -108,7 +109,7 @@ state.go        → In-memory orchestrator state machine
 
 | Spec | This Implementation |
 |---|---|
-| Codex app-server | `kimi-cli` subprocess (one turn per invocation) |
+| Codex app-server | `codex exec` subprocess (one turn per invocation) |
 | max_turns default 20 | **500** |
 | HTTP API / dashboard | **None** (logs only) |
 | thread_id/turn_id sessions | Not applicable; workspace files serve as persistent state |

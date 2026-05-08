@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
-// AgentRunner launches the coding agent subprocess (kimi-cli).
+// AgentRunner launches the coding agent subprocess.
 type AgentRunner struct {
 	cfg    *Config
 	logger *Logger
@@ -38,9 +41,20 @@ func (ar *AgentRunner) RunTurn(issue Issue, workspacePath string, prompt string,
 
 	// Build command with prompt substitution
 	cmdStr := ar.cfg.Codex.Command
+	modelArg := ""
+	if model := ar.modelFromIssueLabels(issue); model != "" {
+		modelArg = "-m " + shellEscape(model)
+		logger.Info("model_selected_from_label", map[string]string{"model": model})
+	}
 	if strings.Contains(cmdStr, "{{.Prompt}}") {
+		if modelArg != "" {
+			cmdStr = strings.Replace(cmdStr, "{{.Prompt}}", modelArg+" {{.Prompt}}", 1)
+		}
 		cmdStr = strings.ReplaceAll(cmdStr, "{{.Prompt}}", shellEscape(prompt))
 	} else {
+		if modelArg != "" {
+			cmdStr = cmdStr + " " + modelArg
+		}
 		// Append prompt as last argument if no placeholder
 		cmdStr = cmdStr + " " + shellEscape(prompt)
 	}
@@ -55,8 +69,20 @@ func (ar *AgentRunner) RunTurn(issue Issue, workspacePath string, prompt string,
 	ctx, cancel := context.WithTimeout(context.Background(), turnTimeout)
 	defer cancel()
 
+	symphonyPath := filepath.Join(workspacePath, ".symphony")
+	envPath := os.Getenv("PATH") + ":" + symphonyPath
+	cmdStr = "export PATH=\"" + envPath + "\"; " + cmdStr
+
 	cmd := exec.CommandContext(ctx, "bash", "-lc", cmdStr)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = workspacePath
+	cmd.Env = append(os.Environ(),
+		"LINEAR_API_KEY="+ar.cfg.Tracker.APIKey,
+		"LINEAR_ENDPOINT="+ar.cfg.Tracker.Endpoint,
+		"LINEAR_PROJECT_SLUG="+ar.cfg.Tracker.ProjectSlug,
+		"SYMPHONY_ISSUE_ID="+issue.ID,
+		"SYMPHONY_ISSUE_IDENTIFIER="+issue.Identifier,
+	)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -67,7 +93,7 @@ func (ar *AgentRunner) RunTurn(issue Issue, workspacePath string, prompt string,
 		return TurnResult{Success: false, Error: fmt.Sprintf("stderr_pipe_error: %v", err)}
 	}
 
-	stallTimeout := time.Duration(ar.cfg.Codex.StallTimeoutMs) * time.Millisecond
+	stallTimeout := time.Duration(*ar.cfg.Codex.StallTimeoutMs) * time.Millisecond
 	lastActivity := time.Now()
 	var activityMu sync.Mutex
 	updateActivity := func() {
@@ -170,6 +196,22 @@ func (ar *AgentRunner) RunTurn(issue Issue, workspacePath string, prompt string,
 
 	logger.Info("turn_completed", map[string]string{"exit_code": "0"})
 	return TurnResult{Success: true, ExitCode: 0, TurnCount: turnCount}
+}
+
+func (ar *AgentRunner) modelFromIssueLabels(issue Issue) string {
+	prefix := normalizeState(ar.cfg.Codex.ModelLabelPrefix)
+	if prefix == "" {
+		return ""
+	}
+	for _, label := range issue.Labels {
+		if strings.HasPrefix(label, prefix) {
+			model := strings.TrimSpace(strings.TrimPrefix(label, prefix))
+			if model != "" {
+				return model
+			}
+		}
+	}
+	return ""
 }
 
 // shellEscape escapes a string for safe use in a single-quoted bash argument.

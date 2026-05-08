@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -13,7 +13,9 @@ import (
 type Tracker interface {
 	FetchCandidateIssues(ctx context.Context, activeStates []string) ([]Issue, error)
 	FetchIssuesByStates(ctx context.Context, states []string) ([]Issue, error)
+	FetchIssueByID(ctx context.Context, issueID string) (Issue, error)
 	FetchIssueStatesByIDs(ctx context.Context, issueIDs []string) (map[string]string, error)
+	UpdateIssueState(ctx context.Context, issueID, stateName string) error
 }
 
 // Orchestrator manages polling, dispatch, retry, and reconciliation.
@@ -159,7 +161,7 @@ func (o *Orchestrator) reconcile(cfg *Config) {
 	}
 
 	// Stall detection
-	stallTimeout := time.Duration(cfg.Codex.StallTimeoutMs) * time.Millisecond
+	stallTimeout := time.Duration(*cfg.Codex.StallTimeoutMs) * time.Millisecond
 	now := time.Now()
 	for _, entry := range running {
 		if stallTimeout <= 0 {
@@ -216,7 +218,14 @@ func (o *Orchestrator) reconcile(cfg *Config) {
 				terminateProcess(entry.PID)
 			}
 			o.state.RemoveRunning(entry.IssueID)
-			o.wm.CleanWorkspace(Issue{ID: entry.IssueID, Identifier: entry.IssueIdentifier})
+			if issue, err := o.tracker.FetchIssueByID(context.Background(), entry.IssueID); err == nil {
+				o.cleanTerminalIssue(issue, cfg)
+			} else {
+				o.logger.Warn("terminal_issue_fetch_failed", map[string]string{
+					"issue_id": entry.IssueID,
+					"error":    err.Error(),
+				})
+			}
 			o.state.Release(entry.IssueID)
 		} else if !cfg.IsActive(stateName) {
 			o.logger.Info("issue_inactive_stopping", map[string]string{
@@ -258,6 +267,21 @@ func (o *Orchestrator) isDispatchEligible(issue Issue, cfg *Config, terminalSet 
 	if issue.IsBlocked(terminalSet) && stateKey == "todo" {
 		return false
 	}
+	if issue.Parent != nil {
+		if issue.Parent.Identifier == "" {
+			return false
+		}
+		if !cfg.IsParentReady(issue.Parent.State) {
+			return false
+		}
+		if cfg.Workspace.WorktreeBare == "" {
+			return false
+		}
+		parentBranch := issueBranch(issue.Parent.Identifier)
+		if cfg.Workspace.ChildRequiresParentBranch && !o.wm.branchExists(cfg.Workspace.WorktreeBare, parentBranch) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -280,6 +304,38 @@ func (o *Orchestrator) sortCandidates(candidates []Issue, terminalSet map[string
 		}
 		return candidates[i].Identifier < candidates[j].Identifier
 	})
+}
+
+func (o *Orchestrator) cleanTerminalIssue(issue Issue, cfg *Config) {
+	for _, child := range issue.Children {
+		if !cfg.IsTerminal(child.State) {
+			o.logger.Info("terminal_cleanup_deferred_open_children", map[string]string{
+				"issue_id":         issue.ID,
+				"issue_identifier": issue.Identifier,
+				"child_identifier": child.Identifier,
+				"child_state":      child.State,
+			})
+			return
+		}
+	}
+
+	if !o.wm.CleanWorkspace(issue) {
+		return
+	}
+	if issue.Parent != nil && issue.Parent.ID != "" && cfg.Workspace.ParentReviewState != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := o.tracker.UpdateIssueState(ctx, issue.Parent.ID, cfg.Workspace.ParentReviewState); err != nil {
+			o.logger.Warn("parent_review_transition_failed", map[string]string{
+				"issue_id":          issue.ID,
+				"issue_identifier":  issue.Identifier,
+				"parent_id":         issue.Parent.ID,
+				"parent_identifier": issue.Parent.Identifier,
+				"target_state":      cfg.Workspace.ParentReviewState,
+				"error":             err.Error(),
+			})
+		}
+	}
 }
 
 func (o *Orchestrator) dispatch(issue Issue, cfg *Config, attempt int) {
@@ -350,6 +406,18 @@ func (o *Orchestrator) runWorker(issue Issue, cfg *Config, entry *RunningEntry) 
 		return
 	}
 	entry.Status = StatusLaunchingAgentProcess
+
+	// Auto-transition to "In Progress" so humans know an agent is working on it
+	// and to prevent duplicate dispatch across multiple daemon instances.
+	if issue.State != "In Progress" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := o.tracker.UpdateIssueState(ctx, issue.ID, "In Progress"); err != nil {
+			logger.Warn("auto_transition_failed", map[string]string{"error": err.Error(), "target_state": "In Progress"})
+		} else {
+			logger.Info("auto_transitioned", map[string]string{"state": "In Progress"})
+		}
+		cancel()
+	}
 
 	turnResult := o.agent.RunTurn(issue, workspacePath, prompt, entry.TurnCount+1)
 	entry.TurnCount = turnResult.TurnCount
@@ -446,6 +514,9 @@ func (o *Orchestrator) handleRetry(issueID, identifier string, attempt int) {
 	o.state.RemoveRetry(issueID)
 	o.mu.Unlock()
 
+	// Release the claim held during the retry backoff so eligibility can be re-evaluated
+	o.state.Release(issueID)
+
 	// Fetch active candidates and find this issue
 	o.mu.Lock()
 	cfg := o.cfg
@@ -497,8 +568,7 @@ func (o *Orchestrator) handleRetry(issueID, identifier string, attempt int) {
 }
 
 func terminateProcess(pid int) {
-	proc, err := os.FindProcess(pid)
-	if err == nil {
-		proc.Kill()
-	}
+	// Kill the entire process group to ensure all children (including
+	// grand-children spawned by the agent) are terminated.
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }

@@ -32,7 +32,7 @@ func RenderPrompt(wf *Workflow, issue Issue, attempt int) (string, error) {
 
 // RenderContinuationPrompt builds a brief prompt for continuation turns.
 func RenderContinuationPrompt(wf *Workflow, issue Issue, attempt int, turnCount int) string {
-	// For kimi-cli, we use a short continuation instruction.
+	// For subprocess agents, we use a short continuation instruction.
 	// The full prompt history is not preserved in a thread; instead the workspace files serve as state.
 	return fmt.Sprintf("Continue working on %s: %s. This is turn %d of the session. Review the current workspace state and proceed with the next steps.", issue.Identifier, issue.Title, turnCount)
 }

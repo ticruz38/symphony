@@ -9,6 +9,15 @@ import (
 )
 
 func main() {
+	if isToolMode() {
+		runToolMode(os.Args[1:])
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "tool" {
+		runToolMode(os.Args[2:])
+		return
+	}
+
 	var workflowPath string
 	flag.StringVar(&workflowPath, "workflow", "WORKFLOW.md", "Path to WORKFLOW.md")
 	flag.Parse()
