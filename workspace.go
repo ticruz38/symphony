@@ -126,9 +126,14 @@ func (wm *WorkspaceManager) prepareWorktree(path string, issue Issue) (string, b
 	}
 
 	branch := issueBranch(issue.Identifier)
-	baseRef := "HEAD"
+	baseRef := wm.cfg.Workspace.MergeTarget
+	if baseRef == "" {
+		baseRef = "HEAD"
+	}
 	if issue.Parent != nil && issue.Parent.Identifier != "" {
 		baseRef = issueBranch(issue.Parent.Identifier)
+	} else if wm.cfg.Workspace.WorktreeRemote != "" && wm.cfg.Workspace.MergeTarget != "" {
+		baseRef = "refs/remotes/origin/" + wm.cfg.Workspace.MergeTarget
 	}
 
 	// Ensure branch exists
