@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -311,8 +312,12 @@ func (wm *WorkspaceManager) worktreeHasChanges(path string) (bool, error) {
 }
 
 func (wm *WorkspaceManager) mergeBranchIntoBranch(barePath, branch, target, strategy string, deleteMergedBranch bool) error {
-	// Fetch latest target from origin
-	fetchCmd := exec.Command("git", "-C", barePath, "fetch", "origin", target)
+	// Fetch and update the remote-tracking target. A plain `git fetch origin main`
+	// only refreshes FETCH_HEAD, which can leave origin/main stale and make the
+	// final push non-fast-forward.
+	targetRemoteRef := "refs/remotes/origin/" + target
+	fetchRefspec := target + ":" + targetRemoteRef
+	fetchCmd := exec.Command("git", "-C", barePath, "fetch", "origin", fetchRefspec)
 	fetchCmd.Stdout = os.Stdout
 	fetchCmd.Stderr = os.Stderr
 	if err := fetchCmd.Run(); err != nil && target == wm.cfg.Workspace.MergeTarget {
@@ -323,8 +328,8 @@ func (wm *WorkspaceManager) mergeBranchIntoBranch(barePath, branch, target, stra
 	tmpDir := filepath.Join(os.TempDir(), "symphony_merge_"+SanitizeIdentifier(branch))
 	defer os.RemoveAll(tmpDir)
 
-	// Try origin/target first, then local target
-	worktreeCmd := exec.Command("git", "-C", barePath, "worktree", "add", "--detach", tmpDir, "origin/"+target)
+	// Try the freshly updated remote-tracking target first, then local target.
+	worktreeCmd := exec.Command("git", "-C", barePath, "worktree", "add", "--detach", tmpDir, targetRemoteRef)
 	if err := worktreeCmd.Run(); err != nil {
 		worktreeCmd = exec.Command("git", "-C", barePath, "worktree", "add", "--detach", tmpDir, target)
 		if err := worktreeCmd.Run(); err != nil {
@@ -452,6 +457,20 @@ func (wm *WorkspaceManager) CleanWorkspace(issue Issue) bool {
 				// Keep worktree alive for manual conflict resolution
 				return false
 			}
+			if target == wm.cfg.Workspace.MergeTarget && wm.cfg.Hooks.AfterMerge != "" {
+				if err := wm.runHook("after_merge", wm.cfg.Hooks.AfterMerge, path, issue); err != nil {
+					wm.logger.Error("after_merge_hook_failed_aborting_cleanup", map[string]string{
+						"issue_id":         issue.ID,
+						"issue_identifier": issue.Identifier,
+						"branch":           branch,
+						"target":           target,
+						"workspace_path":   path,
+						"error":            err.Error(),
+					})
+					// Keep worktree alive so the deployment failure is visible and retryable.
+					return false
+				}
+			}
 		} else if changed, err := wm.worktreeHasChanges(path); err != nil {
 			wm.logger.Warn("terminal_non_done_status_failed_skipping_cleanup", map[string]string{
 				"issue_id":         issue.ID,
@@ -493,6 +512,13 @@ func (wm *WorkspaceManager) CleanWorkspace(issue Issue) bool {
 	return true
 }
 
+func (wm *WorkspaceManager) HasWorkspace(issue Issue) bool {
+	key := SanitizeIdentifier(issue.Identifier)
+	path := filepath.Join(wm.cfg.Workspace.Root, key)
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func (wm *WorkspaceManager) deleteBranch(barePath, branch string) {
 	if err := exec.Command("git", "-C", barePath, "branch", "-D", branch).Run(); err != nil {
 		wm.logger.Warn("branch_delete_failed", map[string]string{
@@ -509,13 +535,16 @@ func (wm *WorkspaceManager) StartupCleanup(tracker Tracker) error {
 		wm.logger.Warn("startup_terminal_cleanup_failed", map[string]string{"error": err.Error()})
 		return err
 	}
+	sort.SliceStable(issues, func(i, j int) bool {
+		ti := issueMergeTime(issues[i])
+		tj := issueMergeTime(issues[j])
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return issues[i].Identifier < issues[j].Identifier
+	})
 	for _, issue := range issues {
-		if normalizeState(issue.State) == "done" {
-			wm.logger.Info("startup_done_cleanup_skipped", map[string]string{
-				"issue_id":         issue.ID,
-				"issue_identifier": issue.Identifier,
-				"state":            issue.State,
-			})
+		if !wm.HasWorkspace(issue) {
 			continue
 		}
 		hasOpenChildren := false

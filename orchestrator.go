@@ -118,13 +118,16 @@ func (o *Orchestrator) tick() {
 	// 1. Reconcile running issues
 	o.reconcile(cfg)
 
-	// 2. Validate config
+	// 2. Reconcile terminal workspaces that are no longer active/running.
+	o.reconcileTerminalWorkspaces(cfg)
+
+	// 3. Validate config
 	if err := validateConfig(cfg); err != nil {
 		o.logger.Error("dispatch_validation_failed", map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 3. Fetch candidate issues
+	// 4. Fetch candidate issues
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	candidates, err := o.tracker.FetchCandidateIssues(ctx, cfg.Tracker.ActiveStates)
 	cancel()
@@ -133,11 +136,11 @@ func (o *Orchestrator) tick() {
 		return
 	}
 
-	// 4. Sort candidates
+	// 5. Sort candidates
 	terminalSet := cfg.TerminalStateSet()
 	o.sortCandidates(candidates, terminalSet)
 
-	// 5. Dispatch
+	// 6. Dispatch
 	available := o.state.AvailableSlots()
 	for _, issue := range candidates {
 		if available <= 0 {
@@ -151,6 +154,29 @@ func (o *Orchestrator) tick() {
 		}
 		o.dispatch(issue, cfg, 0)
 		available--
+	}
+}
+
+func (o *Orchestrator) reconcileTerminalWorkspaces(cfg *Config) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	issues, err := o.tracker.FetchIssuesByStates(ctx, cfg.Tracker.TerminalStates)
+	cancel()
+	if err != nil {
+		o.logger.Error("terminal_issue_fetch_failed", map[string]string{"error": err.Error()})
+		return
+	}
+
+	o.sortTerminalIssuesForMerge(issues)
+	for _, issue := range issues {
+		if !o.wm.HasWorkspace(issue) {
+			continue
+		}
+		o.logger.Info("terminal_workspace_reconcile", map[string]string{
+			"issue_id":         issue.ID,
+			"issue_identifier": issue.Identifier,
+			"state":            issue.State,
+		})
+		o.cleanTerminalIssue(issue, cfg)
 	}
 }
 
@@ -304,6 +330,27 @@ func (o *Orchestrator) sortCandidates(candidates []Issue, terminalSet map[string
 		}
 		return candidates[i].Identifier < candidates[j].Identifier
 	})
+}
+
+func (o *Orchestrator) sortTerminalIssuesForMerge(issues []Issue) {
+	sort.SliceStable(issues, func(i, j int) bool {
+		ti := issueMergeTime(issues[i])
+		tj := issueMergeTime(issues[j])
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return issues[i].Identifier < issues[j].Identifier
+	})
+}
+
+func issueMergeTime(issue Issue) time.Time {
+	if issue.UpdatedAt != nil {
+		return *issue.UpdatedAt
+	}
+	if issue.CreatedAt != nil {
+		return *issue.CreatedAt
+	}
+	return time.Time{}
 }
 
 func (o *Orchestrator) cleanTerminalIssue(issue Issue, cfg *Config) {
