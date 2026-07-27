@@ -276,7 +276,10 @@ func (wm *WorkspaceManager) createWorktree(barePath, path, branch string) error 
 }
 
 func (wm *WorkspaceManager) removeWorktree(barePath, path string) {
-	exec.Command("git", "-C", barePath, "worktree", "remove", path).Run()
+	// Issue changes are committed before terminal cleanup. Force removal so the
+	// orchestration-only .symphony helper does not leave a stale worktree
+	// registration that also prevents deletion of the merged issue branch.
+	exec.Command("git", "-C", barePath, "worktree", "remove", "--force", path).Run()
 	exec.Command("git", "-C", barePath, "worktree", "prune").Run()
 }
 
