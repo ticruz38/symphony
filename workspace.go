@@ -234,7 +234,14 @@ func (wm *WorkspaceManager) ensureBareRepo(barePath, remote string) error {
 }
 
 func (wm *WorkspaceManager) fetchBareRepo(barePath string) error {
-	cmd := exec.Command("git", "-C", barePath, "fetch", "origin")
+	args := []string{"-C", barePath, "fetch", "origin"}
+	if target := strings.TrimSpace(wm.cfg.Workspace.MergeTarget); target != "" {
+		// Older shared bare repositories may not have remote.origin.fetch
+		// configured. In that case a successful plain fetch only refreshes
+		// FETCH_HEAD and leaves the ref used to create/resume worktrees stale.
+		args = append(args, "+"+target+":refs/remotes/origin/"+target)
+	}
+	cmd := exec.Command("git", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

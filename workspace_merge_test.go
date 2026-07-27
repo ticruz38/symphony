@@ -140,8 +140,8 @@ func TestPrepareWorkspaceCheckpointsChangesAndSyncsCurrentMain(t *testing.T) {
 	runGit(t, seed, "remote", "add", "origin", origin)
 	runGit(t, seed, "push", "-u", "origin", "main")
 	runGit(t, root, "clone", "--bare", origin, bare)
-	runGit(t, bare, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
-	runGit(t, bare, "fetch", "origin")
+	// Match older production bare repositories: origin has a URL but no fetch
+	// refspec and therefore no origin/main until Symphony fetches it explicitly.
 
 	wm := NewWorkspaceManager(&Config{
 		Workspace: WorkspaceConfig{
