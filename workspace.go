@@ -136,21 +136,23 @@ func (wm *WorkspaceManager) prepareWorktree(path string, issue Issue) (string, b
 	} else if wm.cfg.Workspace.WorktreeRemote != "" && wm.cfg.Workspace.MergeTarget != "" {
 		baseRef = "refs/remotes/origin/" + wm.cfg.Workspace.MergeTarget
 	}
+	syncOnResume := issue.Parent == nil || issue.Parent.Identifier == "" || wm.cfg.Workspace.ChildSyncOnStart
 
 	// Ensure branch exists
+	branchExisted := wm.branchExists(barePath, branch)
 	if err := wm.ensureBranch(barePath, branch, baseRef); err != nil {
 		return "", false, fmt.Errorf("branch_creation_failed: %w", err)
-	}
-	if issue.Parent != nil && issue.Parent.Identifier != "" && wm.cfg.Workspace.ChildSyncOnStart {
-		parentBranch := issueBranch(issue.Parent.Identifier)
-		if err := wm.mergeBranchIntoBranch(barePath, parentBranch, branch, "", false, nil); err != nil {
-			return "", false, fmt.Errorf("parent_sync_failed: %w", err)
-		}
 	}
 
 	// Check if worktree already exists
 	if _, err := os.Stat(path); err == nil {
 		absPath, _ := filepath.Abs(path)
+		if err := wm.commitWorktreeChanges(absPath, issue); err != nil {
+			return "", false, fmt.Errorf("workspace_checkpoint_failed: %w", err)
+		}
+		if syncOnResume {
+			wm.syncWorktreeWithBase(absPath, baseRef, issue)
+		}
 		wm.ensureSymphonyToolSymlink(absPath, issue)
 		return absPath, false, nil
 	}
@@ -158,6 +160,9 @@ func (wm *WorkspaceManager) prepareWorktree(path string, issue Issue) (string, b
 	// Create worktree
 	if err := wm.createWorktree(barePath, path, branch); err != nil {
 		return "", false, fmt.Errorf("worktree_creation_failed: %w", err)
+	}
+	if branchExisted && syncOnResume {
+		wm.syncWorktreeWithBase(path, baseRef, issue)
 	}
 
 	wm.logger.Info("worktree_created", map[string]string{
@@ -179,6 +184,37 @@ func (wm *WorkspaceManager) prepareWorktree(path string, issue Issue) (string, b
 	absPath, _ := filepath.Abs(path)
 	wm.ensureSymphonyToolSymlink(absPath, issue)
 	return absPath, true, nil
+}
+
+// syncWorktreeWithBase brings a resumed issue branch up to date before the
+// agent validates or extends it. A real merge conflict is intentionally left
+// in the worktree for the issue agent to resolve; silently selecting either
+// side would risk losing previously merged work.
+func (wm *WorkspaceManager) syncWorktreeWithBase(path, baseRef string, issue Issue) {
+	if baseRef == "" || baseRef == "HEAD" {
+		return
+	}
+
+	cmd := exec.Command("git", "-C", path, "merge", baseRef, "--no-edit")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		wm.logger.Warn("workspace_target_sync_needs_resolution", map[string]string{
+			"issue_id":         issue.ID,
+			"issue_identifier": issue.Identifier,
+			"workspace_path":   path,
+			"base_ref":         baseRef,
+			"error":            err.Error(),
+		})
+		return
+	}
+
+	wm.logger.Info("workspace_target_synced", map[string]string{
+		"issue_id":         issue.ID,
+		"issue_identifier": issue.Identifier,
+		"workspace_path":   path,
+		"base_ref":         baseRef,
+	})
 }
 
 func (wm *WorkspaceManager) ensureBareRepo(barePath, remote string) error {
@@ -309,7 +345,13 @@ func (wm *WorkspaceManager) commitWorktreeChanges(path string, issue Issue) erro
 }
 
 func (wm *WorkspaceManager) worktreeHasChanges(path string) (bool, error) {
-	statusCmd := exec.Command("git", "-C", path, "status", "--porcelain")
+	// The local helper symlink is orchestration state, not issue work. Ignoring
+	// it lets canceled/duplicate no-code workspaces be cleaned normally.
+	statusCmd := exec.Command(
+		"git", "-C", path,
+		"status", "--porcelain", "--untracked-files=all",
+		"--", ".", ":(exclude).symphony",
+	)
 	statusOut, err := statusCmd.Output()
 	if err != nil {
 		return false, fmt.Errorf("status failed: %w", err)

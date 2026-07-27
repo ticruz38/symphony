@@ -120,6 +120,85 @@ func TestMergeBranchIntoBranchValidatesMergedResult(t *testing.T) {
 	})
 }
 
+func TestPrepareWorkspaceCheckpointsChangesAndSyncsCurrentMain(t *testing.T) {
+	t.Setenv("GIT_AUTHOR_NAME", "Symphony Test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "symphony-test@localhost")
+	t.Setenv("GIT_COMMITTER_NAME", "Symphony Test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "symphony-test@localhost")
+
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	bare := filepath.Join(root, "integration.git")
+	workspaces := filepath.Join(root, "workspaces")
+
+	runGit(t, root, "init", "--bare", origin)
+	runGit(t, root, "init", "-b", "main", seed)
+	writeTestFile(t, filepath.Join(seed, "base.txt"), "base\n")
+	runGit(t, seed, "add", "base.txt")
+	runGit(t, seed, "commit", "-m", "base")
+	runGit(t, seed, "remote", "add", "origin", origin)
+	runGit(t, seed, "push", "-u", "origin", "main")
+	runGit(t, root, "clone", "--bare", origin, bare)
+	runGit(t, bare, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+	runGit(t, bare, "fetch", "origin")
+
+	wm := NewWorkspaceManager(&Config{
+		Workspace: WorkspaceConfig{
+			Root:           workspaces,
+			WorktreeBare:   bare,
+			WorktreeRemote: origin,
+			MergeTarget:    "main",
+		},
+	}, NewLogger(&bytes.Buffer{}))
+	issue := Issue{ID: "issue-id", Identifier: "GOO-TEST", Title: "Test resume"}
+
+	path, created, err := wm.PrepareWorkspace(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("first PrepareWorkspace() did not create a workspace")
+	}
+	writeTestFile(t, filepath.Join(path, "issue.txt"), "issue\n")
+
+	writeTestFile(t, filepath.Join(seed, "main.txt"), "main\n")
+	runGit(t, seed, "add", "main.txt")
+	runGit(t, seed, "commit", "-m", "main update")
+	runGit(t, seed, "push", "origin", "main")
+
+	resumedPath, created, err := wm.PrepareWorkspace(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Fatal("resumed PrepareWorkspace() unexpectedly created a workspace")
+	}
+	if resumedPath != path {
+		t.Fatalf("resumed path = %q, want %q", resumedPath, path)
+	}
+	if got := readTestFile(t, filepath.Join(path, "issue.txt")); got != "issue\n" {
+		t.Fatalf("checkpointed issue content = %q", got)
+	}
+	if got := readTestFile(t, filepath.Join(path, "main.txt")); got != "main\n" {
+		t.Fatalf("synced main content = %q", got)
+	}
+	runGit(t, path, "merge-base", "--is-ancestor", "refs/remotes/origin/main", "HEAD")
+
+	status := exec.Command(
+		"git", "-C", path,
+		"status", "--porcelain", "--untracked-files=all",
+		"--", ".", ":(exclude).symphony",
+	)
+	output, err := status.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, output)
+	}
+	if len(output) != 0 {
+		t.Fatalf("resumed workspace has uncommitted issue changes:\n%s", output)
+	}
+}
+
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
