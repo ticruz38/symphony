@@ -55,6 +55,7 @@ type HooksConfig struct {
 	AfterCreate  string `yaml:"after_create"`
 	BeforeRun    string `yaml:"before_run"`
 	AfterRun     string `yaml:"after_run"`
+	BeforeMerge  string `yaml:"before_merge"`
 	AfterMerge   string `yaml:"after_merge"`
 	BeforeRemove string `yaml:"before_remove"`
 	TimeoutMs    int    `yaml:"timeout_ms"`

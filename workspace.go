@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -142,7 +143,7 @@ func (wm *WorkspaceManager) prepareWorktree(path string, issue Issue) (string, b
 	}
 	if issue.Parent != nil && issue.Parent.Identifier != "" && wm.cfg.Workspace.ChildSyncOnStart {
 		parentBranch := issueBranch(issue.Parent.Identifier)
-		if err := wm.mergeBranchIntoBranch(barePath, parentBranch, branch, "theirs", false); err != nil {
+		if err := wm.mergeBranchIntoBranch(barePath, parentBranch, branch, "", false, nil); err != nil {
 			return "", false, fmt.Errorf("parent_sync_failed: %w", err)
 		}
 	}
@@ -237,7 +238,7 @@ func (wm *WorkspaceManager) removeWorktree(barePath, path string) {
 }
 
 func (wm *WorkspaceManager) mergeWorktreeBranch(barePath, branch, target string) error {
-	return wm.mergeBranchIntoBranch(barePath, branch, target, "theirs", true)
+	return wm.mergeBranchIntoBranch(barePath, branch, target, "", true, nil)
 }
 
 func (wm *WorkspaceManager) commitWorktreeChanges(path string, issue Issue) error {
@@ -316,7 +317,25 @@ func (wm *WorkspaceManager) worktreeHasChanges(path string) (bool, error) {
 	return len(strings.TrimSpace(string(statusOut))) > 0, nil
 }
 
-func (wm *WorkspaceManager) mergeBranchIntoBranch(barePath, branch, target, strategy string, deleteMergedBranch bool) error {
+func (wm *WorkspaceManager) mergeBranchIntoBranch(
+	barePath, branch, target, strategy string,
+	deleteMergedBranch bool,
+	beforePush func(mergedWorktreePath string) error,
+) error {
+	// The app, access, and landing daemons share one bare repository and one
+	// merge target. Serialize fetch/merge/validation/push across processes so
+	// two individually valid terminal issues cannot race each other's push.
+	lockPath := barePath + ".symphony-merge.lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open merge lock failed: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquire merge lock failed: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
 	// Fetch and update the remote-tracking target. A plain `git fetch origin main`
 	// only refreshes FETCH_HEAD, which can leave origin/main stale and make the
 	// final push non-fast-forward.
@@ -355,6 +374,15 @@ func (wm *WorkspaceManager) mergeBranchIntoBranch(barePath, branch, target, stra
 		// Abort the failed merge
 		exec.Command("git", "-C", tmpDir, "merge", "--abort").Run()
 		return fmt.Errorf("merge failed (conflicts?): %w", err)
+	}
+
+	// Validate the exact candidate that will be pushed, after combining the
+	// issue branch with the latest target. Validating the stale issue worktree
+	// can miss integration failures introduced by concurrent merged issues.
+	if beforePush != nil {
+		if err := beforePush(tmpDir); err != nil {
+			return fmt.Errorf("merged result validation failed: %w", err)
+		}
 	}
 
 	if target == wm.cfg.Workspace.MergeTarget {
@@ -435,10 +463,9 @@ func (wm *WorkspaceManager) CleanWorkspace(issue Issue) bool {
 		if shouldMerge {
 			branch := issueBranch(issue.Identifier)
 			target := wm.cfg.Workspace.MergeTarget
-			strategy := "theirs"
+			strategy := ""
 			if issue.Parent != nil && issue.Parent.Identifier != "" {
 				target = issueBranch(issue.Parent.Identifier)
-				strategy = "theirs"
 			}
 			if err := wm.commitWorktreeChanges(path, issue); err != nil {
 				wm.logger.Error("commit_failed_aborting_cleanup", map[string]string{
@@ -451,7 +478,21 @@ func (wm *WorkspaceManager) CleanWorkspace(issue Issue) bool {
 				// Keep worktree alive for manual recovery.
 				return false
 			}
-			if err := wm.mergeBranchIntoBranch(wm.cfg.Workspace.WorktreeBare, branch, target, strategy, false); err != nil {
+			var validateMergedResult func(string) error
+			if target == wm.cfg.Workspace.MergeTarget && wm.cfg.Hooks.BeforeMerge != "" {
+				validateMergedResult = func(mergedWorktreePath string) error {
+					wm.ensureSymphonyToolSymlink(mergedWorktreePath, issue)
+					return wm.runHook("before_merge", wm.cfg.Hooks.BeforeMerge, mergedWorktreePath, issue)
+				}
+			}
+			if err := wm.mergeBranchIntoBranch(
+				wm.cfg.Workspace.WorktreeBare,
+				branch,
+				target,
+				strategy,
+				false,
+				validateMergedResult,
+			); err != nil {
 				wm.logger.Error("merge_failed_aborting_cleanup", map[string]string{
 					"issue_id":         issue.ID,
 					"issue_identifier": issue.Identifier,
